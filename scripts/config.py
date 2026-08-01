@@ -2,6 +2,7 @@
 
 所有模块统一从这里读取配置，便于跨平台（Windows / Linux）部署。
 V2：新增按题型拆分的索引文件路径。
+V3：新增 SQLite 数据库路径 DATABASE_PATH，新增「政治理论」题型。
 """
 from __future__ import annotations
 
@@ -22,6 +23,13 @@ OBSIDIAN_ROOT = Path(os.environ.get("EXAM_OBSIDIAN_ROOT", r"E:\\obsidianNote\\�
 MISTAKE_ROOT = OBSIDIAN_ROOT / "错题库"
 KNOWLEDGE_ROOT = OBSIDIAN_ROOT / "知识点库"
 METHOD_ROOT = OBSIDIAN_ROOT / "方法论"
+
+# ---------------------------------------------------------------------------
+# V3：SQLite 数据库路径
+# ---------------------------------------------------------------------------
+
+# 数据库文件默认路径（可通过 EXAM_MISTAKES_DB 环境变量覆盖）
+DATABASE_PATH = MISTAKE_ROOT / "mistakes.db"
 
 # 主索引（总览摘要，自动从分题型索引生成）
 INDEX_FILE = MISTAKE_ROOT / "index.md"
@@ -51,6 +59,7 @@ QUESTION_TYPES: List[str] = [
     "判断推理",
     "资料分析",
     "常识判断",
+    "政治理论",
 ]
 
 # 可扩展科目（公安 / 申论 / 面试 等）
@@ -150,6 +159,10 @@ KEYWORD_MAP: List[tuple] = [
     ("民法", "民法"),
     ("行政法", "行政法"),
 ]
+
+# 政治理论
+("政治", "政治理论"),
+("新思想", "政治理论"),
 
 
 def ensure_dirs() -> None:

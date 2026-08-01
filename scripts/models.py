@@ -26,6 +26,8 @@ class MistakeCard:
     status: str = "pending"  # pending / mastered
     screenshot: Optional[str] = None  # 截图相对路径 screenshots/错题-XXX.png
     ocr_text: Optional[str] = None  # OCR 提取的题干文本（批量导入时填）
+    tags: str = '{"tag":[]}'  # V3: 用户自定义标签 JSON 格式
+    image_path: str = ""  # V3: 错题图片路径（同 screenshot，冗余兼容）
 
     @property
     def md_filename(self) -> str:
@@ -71,6 +73,7 @@ class IndexEntry:
     next_review: str
     status: str
     question_type: str = ""  # 由所在章节推断
+    tags: str = '{"tag":[]}'  # V3: 标签 JSON
 
     @property
     def stage_str(self) -> str:

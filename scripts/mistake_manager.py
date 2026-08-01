@@ -1,4 +1,4 @@
-"""错题 CRUD 管理器。"""
+﻿"""错题 CRUD 管理器。"""
 from __future__ import annotations
 
 import json
@@ -11,6 +11,7 @@ import config
 import index_manager
 import scheduler
 from models import MistakeCard, review_history_to_table
+import database as db
 
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -36,6 +37,12 @@ def _parse_md_frontmatter(text: str) -> dict:
                     result[k] = int(v)
                 except ValueError:
                     result[k] = 0
+            elif k == "tags":
+                try:
+                    json.loads(v)
+                    result[k] = v
+                except (json.JSONDecodeError, ValueError):
+                    result[k] = '{\"tag\":[]}'
             else:
                 result[k] = v
     return result
@@ -60,6 +67,8 @@ def load_card(mistake_id: str, question_type: str) -> Optional[MistakeCard]:
         review_history=meta.get("review_history", []),
         status=meta.get("status", "pending"),
         screenshot=f"screenshots/{mistake_id}.png",
+        tags=meta.get("tags", '{\"tag\":[]}'),
+        image_path=meta.get("image_path", f"screenshots/{mistake_id}.png"),
     )
 
 
@@ -71,6 +80,7 @@ def create_mistake(
     source: str,
     screenshot_src: Optional[Path] = None,
     ocr_text: Optional[str] = None,
+    tags: str = '{"tag":[]}',
 ) -> MistakeCard:
     if question_type not in config.ALL_TYPES:
         raise ValueError(f"题型 {question_type} 不在支持列表中: {config.ALL_TYPES}")
@@ -99,10 +109,15 @@ def create_mistake(
         status="pending",
         screenshot=screenshot_rel,
         ocr_text=ocr_text,
+        tags=tags,
+        image_path=screenshot_rel,
     )
     md_path = type_dir / f"{new_id}.md"
     md_path.write_text(_card_to_md(card), encoding="utf-8")
     index_manager.add_entry(card)
+    # V3: 同步写入 SQLite
+    db.init_db()
+    db.insert_mistake(card)
     return card
 
 
@@ -129,6 +144,7 @@ review_stage: {card.review_stage}
 next_review: {card.next_review}
 review_history: {history_str}
 status: {card.status}
+tags: {card.tags}
 ---
 
 {ocr_section}
@@ -177,6 +193,11 @@ def update_review_state(
     )
     md_path.write_text(_card_to_md(card), encoding="utf-8")
     index_manager.update_entry(mistake_id, review_stage, next_review, status, qtype=question_type)
+    # V3: 同步更新 SQLite
+    db.update_review_state_db(
+        mistake_id, review_stage, next_review, status,
+        passed, review_date, old_stage,
+    )
 
 
 def delete_mistake(mistake_id: str, question_type: str) -> bool:
@@ -189,6 +210,8 @@ def delete_mistake(mistake_id: str, question_type: str) -> bool:
     if png_path.exists():
         png_path.unlink()
     index_manager.delete_entry(mistake_id)
+    # V3: 同步删除 SQLite
+    db.delete_mistake_db(mistake_id)
     return deleted
 
 
@@ -233,6 +256,8 @@ def modify_mistake(
         # 同步更新索引中的可变字段，保证 index.md 与 .md 一致
         index_manager.delete_entry(mistake_id)
         index_manager.add_entry(card)
+    # V3: 同步更新 SQLite
+    db.update_mistake_field(mistake_id, field, value)
     return card
 
 
@@ -242,3 +267,4 @@ def get_screen_path(mistake_id: str, question_type: str) -> Path:
 
 def list_all_type_dirs() -> List[Path]:
     return [config.MISTAKE_ROOT / t for t in config.ALL_TYPES]
+
