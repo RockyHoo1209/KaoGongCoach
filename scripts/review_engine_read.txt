@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import random
-import os
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -74,10 +73,6 @@ def _is_forget(answer: str) -> bool:
 
 def _row_to_item(row: Dict[str, Any]) -> ReviewSessionItem:
     """将 SQLite 行转换为 ReviewSessionItem。"""
-    img = row.get("image_path", "")
-    if img and not os.path.isabs(img):
-        base = config.MISTAKE_ROOT / row.get("question_type", "")
-        img = str(base / img)
     return ReviewSessionItem(
         mistake_id=row["id"],
         question_type=row.get("question_type", ""),
@@ -109,21 +104,19 @@ def take_batch(
 
 
 def format_review_prompt(items: List[ReviewSessionItem], group_no: int = 1) -> str:
-    """生成复习提示文本（V3版：输出题号列表+直接嵌入图片内容）。
+    """生成复习提示文本（V3简化版：只输出题号列表+图片路径）。
 
     V3遵循用户要求：出题时只需要给出题号列表和对应图片路径的图片。
     文字描述由用户从截图中自行阅读，不需要额外输出考点/来源等信息。
-    图片通过Markdown语法嵌入，便于在对话中直接显现
     """
     lines = [f"📝 错题复习 · 第 {group_no} 组", ""]
     for idx, item in enumerate(items, start=1):
         lines.append(f"【题{idx}】{item.mistake_id}")
-        img_tag = f"![{item.mistake_id}]({item.image_path})" if item.image_path else "(无截图)"
-        lines.append(img_tag)
+        lines.append(f"图片：{item.image_path}")
         lines.append("")
         lines.append("你的答案/思路？（不记得就说「不记得」）")
         lines.append("")
-    lines.append("请回忆答案并用格式回复：1.B 2.C 3.A ...（或写思路描述，不记得就说「不记得」）")
+    lines.append("请回忆答案并用格式回复：1.B 2.C 3.A ... 或写思路描述")
     return "\n".join(lines)
 
 
@@ -204,5 +197,4 @@ def review_batch(
     summary_lines.append("")
     summary_lines.append(f"**通过率**：{passed_count}/{total} ({passed_count/total*100:.0f}%)")
     return results, "\n".join(summary_lines)
-
 

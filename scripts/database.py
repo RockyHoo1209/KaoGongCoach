@@ -1,4 +1,4 @@
-﻿"""SQLite 数据库层 — 错题持久化存储。
+"""SQLite 数据库层 — 错题持久化存储。
 
 使用 SQLite 替代 markdown 文件系统作为错题主存储。
 支持 JSON1 标签检索、艾宾浩斯遗忘曲线调度、批量导入/导出。
@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+import re
 
 import config
 import scheduler
@@ -301,8 +302,8 @@ def get_due_entries_db(today: str) -> List[Dict[str, Any]]:
             """SELECT * FROM mistakes
                WHERE status != 'mastered'
                  AND next_review <= ?
-                 AND knowledge_point != ''
-                 AND error_reason != ''
+                 AND knowledge_point NOT IN ('', '待补充')
+                 AND error_reason NOT IN ('', '待补充')
                ORDER BY next_review ASC, ebbinghaus_value ASC, id""",
             (today,),
         ).fetchall()
@@ -354,12 +355,347 @@ def get_next_id_db() -> str:
     if row:
         last_num = int(row["id"].replace("错题-", ""))
         return f"错题-{last_num + 1:03d}"
+
+
     return "错题-001"
+# ---------------------------------------------------------------------------
+# 从索引文件导入（index-*.md / index.md V3）
+# ---------------------------------------------------------------------------
+
+_INDEX_TABLE_ROW_RE = re.compile(
+    r"^\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|"
+    r"\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|$"
+)
+
 
 
 # ---------------------------------------------------------------------------
-# 标签操作
+# 从 index-*.md / index.md 导入（扫描索引文件 + 寻找对应图片）
 # ---------------------------------------------------------------------------
+
+def _parse_index_table_row(line: str):
+    """Parse index table row, return dict or None.
+
+    Handles multiple table formats found in Obsidian markdown:
+      - Normal: | ID | 考点 | 错因 | 答案 | 来源 | 阶段 | 下次复习 | 状态 |
+      - Double-pipe wrapped: || ID | 考点 | ... | 状态 ||
+      - No leading pipe: ID | 考点 | ...
+    """
+    line = line.strip()
+    if not line:
+        return None
+    # Skip frontmatter / separator lines / non-table content
+    if line.startswith("---") or line.startswith("|--") or line.startswith("|---"):
+        return None
+    # Strip all leading/trailing pipes, then split by |
+    stem = line.strip("|")
+    cells = [c.strip() for c in stem.split("|")]
+    # Expect exactly 8 data cells
+    if len(cells) != 8:
+        return None
+    # Skip header row
+    if cells[0] == "ID":
+        return None
+    # Skip separator row
+    if all(set(c) <= set("-: ") | {""} for c in cells):
+        return None
+    return {
+        "id": cells[0],
+        "knowledge_point": cells[1],
+        "error_reason": cells[2],
+        "correct_answer": cells[3],
+        "source": cells[4],
+        "stage_str": cells[5],
+        "next_review": cells[6],
+        "status": cells[7],
+    }
+
+
+def _parse_index_stage(stage_str: str) -> int:
+    if "/" in stage_str:
+        try:
+            return int(stage_str.split("/")[0])
+        except ValueError:
+            return 0
+    try:
+        return int(stage_str)
+    except ValueError:
+        return 0
+
+
+def _parse_index_status(status_str: str) -> str:
+    if "已掌握" in status_str:
+        return "mastered"
+    return "pending"
+
+
+def _parse_index_md_sections(content: str):
+    """Parse composite index.md with ## section headers + table rows.
+
+    Structure:
+        ## 判断推理
+        | ID | 考点 | 错因 | 答案 | 来源 | 阶段 | 下次复习 | 状态 |
+        |----|------|------|------|------|------|----------|------|
+        | 错题-050 | 逻辑判断 | 待补充 | ... | 判断推理 | 0/6 | ... |
+
+    Returns list of dicts with question_type inferred from ## header.
+    """
+    entries = []
+    current_type = None
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Detect section header: ## 题型名
+        sec_m = re.match(r"^##\s+(.+)$", line)
+        if sec_m:
+            candidate = sec_m.group(1).strip()
+            if candidate in config.ALL_TYPES:
+                current_type = candidate
+            else:
+                current_type = None
+            continue
+
+        # Parse table row within the current section
+        row_data = _parse_index_table_row(line)
+        if row_data and current_type:
+            row_data["question_type"] = current_type
+            entries.append(row_data)
+
+    return entries
+
+
+def import_from_index_files(
+    mistake_root=None,
+    dry_run=False,
+):
+    """从 index-*.md / index.md 索引文件扫描并导入错题到 SQLite。
+
+    扫描指定根目录下所有 index-*.md 文件，解析表格行，
+    然后在对应题型目录下寻找截图（screenshots/{id}.png / {id}.jpg），
+    将图片路径一并入库。
+    """
+    imported = 0
+    skipped = 0
+    errors = 0
+    items = []
+    seen_ids = set()
+
+    target_root = Path(mistake_root) if mistake_root else config.MISTAKE_ROOT
+    if not target_root.exists():
+        raise ValueError(f"目录不存在: {target_root}")
+
+    # 搜索所有 index-*.md 文件
+    index_files = []
+    for pattern in ["index-*.md", "错题库/index-*.md", "**/index-*.md"]:
+        for f in target_root.glob(pattern):
+            index_files.append(f)
+
+    index_files = sorted(set(index_files))
+
+    if not index_files:
+        alt_root = config.MISTAKE_ROOT
+        if alt_root != target_root:
+            index_files = sorted(alt_root.glob("index-*.md"))
+
+    if not index_files:
+        return {
+            "total": 0,
+            "imported": 0,
+            "skipped": 0,
+            "errors": 0,
+            "items": [],
+            "message": "未找到 index-*.md 索引文件",
+        }
+
+    for idx_path in index_files:
+        stem = idx_path.stem
+        if not stem.startswith("index-"):
+            skipped += 1
+            continue
+
+        qtype = stem[6:]
+        if qtype not in config.ALL_TYPES:
+            skipped += 1
+            continue
+
+        text = idx_path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            row_data = _parse_index_table_row(line)
+            if not row_data:
+                continue
+            rid = row_data["id"]
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+
+            try:
+                stage = _parse_index_stage(row_data["stage_str"])
+                status_val = _parse_index_status(row_data["status"])
+
+                # 寻找图片
+                img_path = ""
+                for ext in [".png", ".jpg", ".jpeg", ".webp"]:
+                    candidate = (
+                        target_root / qtype / "screenshots" / f"{rid}{ext}"
+                    )
+                    if not candidate.exists():
+                        candidate = (
+                            config.MISTAKE_ROOT / qtype / "screenshots" / f"{rid}{ext}"
+                        )
+                    if candidate.exists():
+                        img_path = str(candidate)
+                        break
+
+                card = MistakeCard(
+                    id=rid,
+                    date="",
+                    question_type=qtype,
+                    knowledge_point=row_data["knowledge_point"],
+                    error_reason=row_data["error_reason"],
+                    correct_answer=row_data["correct_answer"],
+                    source=row_data["source"],
+                    review_stage=stage,
+                    next_review=row_data["next_review"],
+                    review_history=[],
+                    status=status_val,
+                    screenshot=img_path,
+                    image_path=img_path,
+                )
+
+                if not dry_run:
+                    insert_mistake(card)
+
+                imported += 1
+                items.append({
+                    "id": rid,
+                    "question_type": qtype,
+                    "knowledge_point": row_data["knowledge_point"],
+                    "status": status_val,
+                    "image_path": img_path if img_path else "(无截图)",
+                })
+            except Exception as e:
+                errors += 1
+                items.append({"id": rid, "error": str(e)})
+
+    # -----------------------------------------------------------------------
+    # Phase 2: Parse composite index.md (## sections + table rows)
+    # -----------------------------------------------------------------------
+    index_md_path = target_root / "index.md"
+    if index_md_path.exists():
+        text = index_md_path.read_text(encoding="utf-8")
+        composite_entries = _parse_index_md_sections(text)
+
+        for row_data in composite_entries:
+            rid = row_data["id"]
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+
+            try:
+                qtype = row_data["question_type"]
+                stage = _parse_index_stage(row_data.get("stage_str", "0"))
+                status_val = _parse_index_status(row_data.get("status", "pending"))
+
+                img_path = ""
+                for ext in [".png", ".jpg", ".jpeg", ".webp"]:
+                    candidate = target_root / qtype / "screenshots" / f"{rid}{ext}"
+                    if not candidate.exists():
+                        candidate = config.MISTAKE_ROOT / qtype / "screenshots" / f"{rid}{ext}"
+                    if candidate.exists():
+                        img_path = str(candidate)
+                        break
+
+                card = MistakeCard(
+                    id=rid,
+                    date="",
+                    question_type=qtype,
+                    knowledge_point=row_data.get("knowledge_point", ""),
+                    error_reason=row_data.get("error_reason", ""),
+                    correct_answer=row_data.get("correct_answer", ""),
+                    source=row_data.get("source", ""),
+                    review_stage=stage,
+                    next_review=row_data.get("next_review", ""),
+                    review_history=[],
+                    status=status_val,
+                    screenshot=img_path,
+                    image_path=img_path,
+                )
+
+                if not dry_run:
+                    insert_mistake(card)
+
+                imported += 1
+                items.append({
+                    "id": rid,
+                    "question_type": qtype,
+                    "knowledge_point": row_data.get("knowledge_point", ""),
+                    "status": status_val,
+                    "image_path": img_path if img_path else "\u65e0\u622a\u56fe",
+                })
+            except Exception as e:
+                errors += 1
+                items.append({"id": rid, "error": str(e)})
+
+    return {
+        "total": imported + skipped + errors,
+        "imported": imported,
+        "skipped": skipped,
+        "errors": errors,
+        "items": items,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 组合搜索（按题型 / 标签 / 关键字同时过滤）
+# ---------------------------------------------------------------------------
+
+
+def search_mistakes(
+    question_type=None,
+    tag=None,
+    keyword=None,
+    limit=100,
+):
+    """组合搜索：可按题型、标签、关键词同时过滤。"""
+    conditions = []
+    params = []
+
+    if question_type:
+        conditions.append("question_type = ?")
+        params.append(question_type)
+
+    if tag:
+        conditions.append(
+            "EXISTS (SELECT 1 FROM json_each(tags, '$.tag') WHERE value = ?)"
+        )
+        params.append(tag)
+
+    if keyword:
+        kw = f"%{keyword}%"
+        conditions.append(
+            "(id LIKE ? OR question_type LIKE ? OR knowledge_point LIKE ? "
+            "OR error_reason LIKE ? OR source LIKE ?)"
+        )
+        params.extend([kw, kw, kw, kw, kw])
+
+    where_clause = ""
+    if conditions:
+        where_clause = "WHERE " + " AND ".join(conditions)
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM mistakes {where_clause} ORDER BY id LIMIT ?",
+            params + [limit],
+        ).fetchall()
+    return rows
+
+
+
+# ---------------------------------------------------------------------------
+
 
 def add_tag(mistake_id: str, tag: str) -> bool:
     with get_conn() as conn:
@@ -421,6 +757,13 @@ def get_all_tags() -> List[str]:
                ORDER BY tag"""
         ).fetchall()
     return [r["tag"] for r in rows]
+
+
+
+# ---------------------------------------------------------------------------
+# 组合搜索
+# ---------------------------------------------------------------------------
+
 
 
 # ---------------------------------------------------------------------------

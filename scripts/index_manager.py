@@ -134,6 +134,8 @@ def _get_category_path(qtype: str) -> Path:
 def _ensure_category_index(qtype: str) -> None:
     """确保题型的分类索引文件存在（首次创建时初始化）。"""
     cpath = _get_category_path(qtype)
+    if not cpath.parent.exists():
+        cpath.parent.mkdir(parents=True, exist_ok=True)
     if not cpath.exists():
         cpath.write_text(
             f"""---

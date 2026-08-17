@@ -1,0 +1,16 @@
+def _row_to_item(row: Dict[str, Any]) -> ReviewSessionItem:
+   """将 SQLite 行转换为 ReviewSessionItem。"""
+    img = row.get("image_path", "")
+    if img and not os.path.isabs(img):
+        base = config.MISTAKE_ROOT / row.get("question_type", "")
+        img = str(base / img)
+    return ReviewSessionItem(
+       mistake_id=row["id"],
+       question_type=row.get("question_type", ""),
+       ebbinghaus_value=row.get("ebbinghaus_value", 0),
+       next_review=row.get("next_review", ""),
+       image_path=row.get("image_path", ""),
+       knowledge_point=row.get("knowledge_point", ""),
+   )
+
+

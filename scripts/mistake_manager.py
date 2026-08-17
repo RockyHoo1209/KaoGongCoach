@@ -1,4 +1,10 @@
-﻿"""错题 CRUD 管理器。"""
+"""错题 CRUD 管理器（V3：SQLite 为主存储）。
+
+核心原则：
+1. ID 生成、卡片读写、复习状态更新均优先使用 SQLite
+2. .md 文件保留为 Obsidian 兼容，双向同步
+3. index-*.md 索引文件保留为兼容层
+"""
 from __future__ import annotations
 
 import json
@@ -11,13 +17,22 @@ import config
 import index_manager
 import scheduler
 from models import MistakeCard, review_history_to_table
-import database as db
+from database import (
+    get_next_id_db,
+    get_mistake as db_get_mistake,
+    insert_mistake as db_insert_mistake,
+    update_review_state_db as db_update_review_state,
+    delete_mistake_db as db_delete_mistake,
+    update_mistake_field as db_update_field,
+    init_db as db_init_db,
+)
 
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
 def _parse_md_frontmatter(text: str) -> dict:
+    """解析 .md 文件 frontmatter（兼容保留）。"""
     m = _FRONTMATTER_RE.match(text)
     if not m:
         return {}
@@ -42,19 +57,40 @@ def _parse_md_frontmatter(text: str) -> dict:
                     json.loads(v)
                     result[k] = v
                 except (json.JSONDecodeError, ValueError):
-                    result[k] = '{\"tag\":[]}'
+                    result[k] = '{"tag":[]}'
             else:
                 result[k] = v
     return result
 
 
 def load_card(mistake_id: str, question_type: str) -> Optional[MistakeCard]:
+    """V3：优先从 SQLite 读取，降级到 .md 文件。"""
+    # 1) SQLite 优先
+    row = db_get_mistake(mistake_id)
+    if row:
+        return MistakeCard(
+            id=row["id"],
+            date=row.get("created_at", ""),
+            question_type=row["question_type"],
+            knowledge_point=row.get("knowledge_point", ""),
+            error_reason=row.get("error_reason", ""),
+            correct_answer=row.get("correct_answer", ""),
+            source=row.get("source", ""),
+            review_stage=row.get("ebbinghaus_value", 0),
+            next_review=row.get("next_review", ""),
+            review_history=json.loads(row.get("review_history", "[]")),
+            status=row.get("status", "pending"),
+            screenshot=row.get("image_path", ""),
+            image_path=row.get("image_path", ""),
+            tags=row.get("tags", '{"tag":[]}'),
+        )
+    # 2) 降级到 .md 文件
     md_path = config.MISTAKE_ROOT / question_type / f"{mistake_id}.md"
     if not md_path.exists():
         return None
     text = md_path.read_text(encoding="utf-8")
     meta = _parse_md_frontmatter(text)
-    return MistakeCard(
+    card = MistakeCard(
         id=meta["id"],
         date=meta["date"],
         question_type=meta["题型"],
@@ -67,9 +103,13 @@ def load_card(mistake_id: str, question_type: str) -> Optional[MistakeCard]:
         review_history=meta.get("review_history", []),
         status=meta.get("status", "pending"),
         screenshot=f"screenshots/{mistake_id}.png",
-        tags=meta.get("tags", '{\"tag\":[]}'),
+        tags=meta.get("tags", '{"tag":[]}'),
         image_path=meta.get("image_path", f"screenshots/{mistake_id}.png"),
     )
+    # 自动同步回 SQLite
+    db_init_db()
+    db_insert_mistake(card)
+    return card
 
 
 def create_mistake(
@@ -85,7 +125,8 @@ def create_mistake(
     if question_type not in config.ALL_TYPES:
         raise ValueError(f"题型 {question_type} 不在支持列表中: {config.ALL_TYPES}")
     config.ensure_dirs()
-    new_id = index_manager.next_id(qtype=question_type)
+    # V3: SQLite 为主 ID 生成源
+    new_id = get_next_id_db()
     today = scheduler.today_str()
     type_dir = config.MISTAKE_ROOT / question_type
     screenshot_dir = type_dir / "screenshots"
@@ -95,6 +136,8 @@ def create_mistake(
     screenshot_dst = screenshot_dir / f"{new_id}.png"
     if screenshot_src and Path(screenshot_src).exists():
         shutil.copy2(screenshot_src, screenshot_dst)
+    # 如果提供了绝对路径的截图，直接使用原路径
+    image_path = str(screenshot_src) if screenshot_src and Path(screenshot_src).exists() else screenshot_rel
     card = MistakeCard(
         id=new_id,
         date=today,
@@ -107,17 +150,18 @@ def create_mistake(
         next_review=today,
         review_history=[],
         status="pending",
-        screenshot=screenshot_rel,
+        screenshot=image_path,
         ocr_text=ocr_text,
         tags=tags,
-        image_path=screenshot_rel,
+        image_path=image_path,
     )
+    # V3: SQLite 优先写入
+    db_init_db()
+    db_insert_mistake(card)
+    # 保留 .md 和索引更新用于 Obsidian 兼容
     md_path = type_dir / f"{new_id}.md"
     md_path.write_text(_card_to_md(card), encoding="utf-8")
     index_manager.add_entry(card)
-    # V3: 同步写入 SQLite
-    db.init_db()
-    db.insert_mistake(card)
     return card
 
 
@@ -127,11 +171,11 @@ def _card_to_md(card: MistakeCard) -> str:
     ocr_section = ""
     if card.ocr_text:
         ocr_section = f"""## OCR 文本
-```
+`
 {card.ocr_text}
-```
+`
 """
-    screenshot_ref = f"![[{card.screenshot}]]" if card.screenshot else ""
+    screenshot_ref = f"![[{card.image_path}]]" if card.image_path else ""
     return f"""---
 id: {card.id}
 date: {card.date}
@@ -174,9 +218,12 @@ def update_review_state(
     review_date: str,
     old_stage: int,
 ) -> None:
-    md_path = config.MISTAKE_ROOT / question_type / f"{mistake_id}.md"
-    if not md_path.exists():
-        return
+    # V3: SQLite 优先更新
+    db_update_review_state(
+        mistake_id, review_stage, next_review, status,
+        passed, review_date, old_stage,
+    )
+    # 保留 .md 和索引更新用于 Obsidian 兼容
     card = load_card(mistake_id, question_type)
     if card is None:
         return
@@ -191,16 +238,15 @@ def update_review_state(
             "next_review": next_review,
         }
     )
+    md_path = config.MISTAKE_ROOT / question_type / f"{mistake_id}.md"
     md_path.write_text(_card_to_md(card), encoding="utf-8")
     index_manager.update_entry(mistake_id, review_stage, next_review, status, qtype=question_type)
-    # V3: 同步更新 SQLite
-    db.update_review_state_db(
-        mistake_id, review_stage, next_review, status,
-        passed, review_date, old_stage,
-    )
 
 
 def delete_mistake(mistake_id: str, question_type: str) -> bool:
+    # V3: SQLite 优先删除
+    db_delete_mistake(mistake_id)
+    # 保留文件删除用于 Obsidian 兼容
     md_path = config.MISTAKE_ROOT / question_type / f"{mistake_id}.md"
     png_path = config.MISTAKE_ROOT / question_type / "screenshots" / f"{mistake_id}.png"
     deleted = False
@@ -210,8 +256,6 @@ def delete_mistake(mistake_id: str, question_type: str) -> bool:
     if png_path.exists():
         png_path.unlink()
     index_manager.delete_entry(mistake_id)
-    # V3: 同步删除 SQLite
-    db.delete_mistake_db(mistake_id)
     return deleted
 
 
@@ -256,8 +300,8 @@ def modify_mistake(
         # 同步更新索引中的可变字段，保证 index.md 与 .md 一致
         index_manager.delete_entry(mistake_id)
         index_manager.add_entry(card)
-    # V3: 同步更新 SQLite
-    db.update_mistake_field(mistake_id, field, value)
+    # V3: SQLite 更新
+    db_update_field(mistake_id, field, value)
     return card
 
 
@@ -267,4 +311,3 @@ def get_screen_path(mistake_id: str, question_type: str) -> Path:
 
 def list_all_type_dirs() -> List[Path]:
     return [config.MISTAKE_ROOT / t for t in config.ALL_TYPES]
-

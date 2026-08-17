@@ -1,4 +1,4 @@
-﻿"""错题复习引擎（V3：SQLite 为主存储）。
+"""错题复习引擎（V3：SQLite 为主存储）。
 
 把 SKILL.md Workflow 2（复习模式）脚本化：
 - 从 SQLite 查询到期题目
@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import random
-import os
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -73,19 +72,19 @@ def _is_forget(answer: str) -> bool:
 
 
 def _row_to_item(row: Dict[str, Any]) -> ReviewSessionItem:
-    """将 SQLite 行转换为 ReviewSessionItem。"""
+   """将 SQLite 行转换为 ReviewSessionItem。"""
     img = row.get("image_path", "")
     if img and not os.path.isabs(img):
         base = config.MISTAKE_ROOT / row.get("question_type", "")
         img = str(base / img)
     return ReviewSessionItem(
-        mistake_id=row["id"],
-        question_type=row.get("question_type", ""),
-        ebbinghaus_value=row.get("ebbinghaus_value", 0),
-        next_review=row.get("next_review", ""),
-        image_path=row.get("image_path", ""),
-        knowledge_point=row.get("knowledge_point", ""),
-    )
+       mistake_id=row["id"],
+       question_type=row.get("question_type", ""),
+       ebbinghaus_value=row.get("ebbinghaus_value", 0),
+       next_review=row.get("next_review", ""),
+       image_path=row.get("image_path", ""),
+       knowledge_point=row.get("knowledge_point", ""),
+   )
 
 
 def select_due_items(
@@ -204,5 +203,3 @@ def review_batch(
     summary_lines.append("")
     summary_lines.append(f"**通过率**：{passed_count}/{total} ({passed_count/total*100:.0f}%)")
     return results, "\n".join(summary_lines)
-
-
